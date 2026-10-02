@@ -1,23 +1,83 @@
+using System.Text;
+using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
+
 namespace NotificationSystem.Worker;
 
 public class Worker : BackgroundService
 {
+    private readonly IConnection _connection;
     private readonly ILogger<Worker> _logger;
 
-    public Worker(ILogger<Worker> logger)
+    public Worker(
+        IConnection connection,
+        ILogger<Worker> logger)
     {
+        _connection = connection;
         _logger = logger;
     }
 
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    protected override async Task ExecuteAsync(
+        CancellationToken stoppingToken)
     {
-        while (!stoppingToken.IsCancellationRequested)
+        await using var channel =
+            await _connection.CreateChannelAsync(cancellationToken: stoppingToken);
+
+        await channel.QueueDeclareAsync(
+            queue: "notification.queue",
+            durable: true,
+            exclusive: false,
+            autoDelete: false,
+            cancellationToken: stoppingToken);
+
+        var consumer = new AsyncEventingBasicConsumer(channel);
+
+        consumer.ReceivedAsync += async (_, eventArgs) =>
         {
-            if (_logger.IsEnabled(LogLevel.Information))
+            try
             {
-                _logger.LogInformation("Worker running at: {time}", DateTimeOffset.Now);
+                var body = eventArgs.Body.ToArray();
+
+                var message = Encoding.UTF8.GetString(body);
+
+                _logger.LogInformation(
+                    "Message received: {Message}",
+                    message);
+
+                //await channel.BasicAckAsync(
+                //    deliveryTag: eventArgs.DeliveryTag,
+                //    multiple: false);
             }
-            await Task.Delay(1000, stoppingToken);
+            catch (Exception ex)
+            {
+                _logger.LogError(
+                    ex,
+                    "Error while processing message.");
+
+                await channel.BasicNackAsync(
+                    deliveryTag: eventArgs.DeliveryTag,
+                    multiple: false,
+                    requeue: true);
+            }
+        };
+
+        await channel.BasicConsumeAsync(
+            queue: "notification.queue",
+            autoAck: false,
+            consumer: consumer);
+
+        _logger.LogInformation(
+            "Consumer started. Waiting for messages...");
+
+        try
+        {
+            await Task.Delay(
+                Timeout.Infinite,
+                stoppingToken);
+        }
+        catch (OperationCanceledException)
+        {
+            // Application is shutting down.
         }
     }
 }
